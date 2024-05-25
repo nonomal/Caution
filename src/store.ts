@@ -1,17 +1,17 @@
-import {writable} from "svelte/store";
-import {open} from "@tauri-apps/api/dialog";
+import {type Writable, writable} from "svelte/store";
+import {open} from "@tauri-apps/plugin-dialog";
 import {sep} from "@tauri-apps/api/path";
-import {invoke} from "@tauri-apps/api/tauri";
+import {invoke} from "@tauri-apps/api/core";
 import {crossfade, fly} from "svelte/transition";
 import {listen} from "@tauri-apps/api/event";
 import {createPop} from "./common";
-import {selectedTemplate} from "./Upload.svelte";
+import type {BiliupConfig, SelectedTemplate} from "./global";
 
 
 export const isLogin = writable(false);
 export const template = writable({});
 
-export const currentTemplate = writable({
+export const currentTemplate: Writable<{current: string, selectedTemplate: SelectedTemplate}> = writable({
     current: '',
     selectedTemplate: {
         title: '',
@@ -34,6 +34,7 @@ export const [send, receive] = crossfade({
     },
 });
 export const fileselect = () => {
+    console.log("fileselect()")
     let properties = {
         // defaultPath: 'C:\\',
         multiple: true,
@@ -44,13 +45,14 @@ export const fileselect = () => {
         }]
     };
     open(properties).then((pathStr) => {
-        console.log(pathStr);
+        console.log("pathStr", pathStr);
         if (!pathStr) return;
         attach(pathStr);
     });
 };
 
-export function attach(files) {
+export function attach(files: {name: string, path: string}[]) {
+    console.log("attach(files)", files);
     currentTemplate.update(temp => {
         function findFile(file) {
             return temp.selectedTemplate['files'].find((existingFile) => existingFile.id === file);
@@ -61,13 +63,12 @@ export function attach(files) {
                 createPop('请上传非重复视频！');
                 continue;
             }
-            let split = file.split(sep);
-            let filename = split[split.length - 1];
+            let filename = file.name;
 
             // temp['files'] = [...temp['files'], ...event.target.files];
             temp.selectedTemplate['files'].push({
-                filename: file,
-                id: file,
+                filename: file.path,
+                id: file.name,
                 title: filename.substring(0, filename.lastIndexOf(".")),
                 desc: '',
                 progress: 0,
@@ -87,8 +88,8 @@ export function attach(files) {
     });
 }
 
-function allComplete(files, temp) {
-    // console.log(temp);
+function allComplete(files: SelectedTemplate['files'], temp: SelectedTemplate) {
+    console.log("allComplete(files, temp)", files, temp);
     for (const file of files) {
         if (!file.complete && !file.process && temp.atomicInt < 1) {
             temp.atomicInt++;
@@ -101,12 +102,14 @@ function allComplete(files, temp) {
     return true;
 }
 
-function upload(video, temp) {
+function upload(video: {title: string, filename: string, desc: string, [key:string]: any}, temp) {
     // const files = [];
+    console.log("upload(video, temp)", video, temp);
     video.start = Date.now();
     invoke('upload', {
         video: video
     }).then((res) => {
+        console.log("invoke(upload, video)", res);
         // temp.atomicInt--;
         // video.filename = res[0].filename;
         // video.speed = res[1];
@@ -115,11 +118,15 @@ function upload(video, temp) {
         currentTemplate.update(t => {
             t.selectedTemplate.files.forEach(file => {
                 if (file.id === video.id) {
+                    console.log(`file.id(${file.id}) === video.id(${video.id})`)
                     file.filename = res.filename;
                     const millis = Date.now() - file.start;
                     file.speed = file.totalSize / 1000 / millis;
                     file.complete = true;
                     file.progress = 100;
+                }
+                else {
+                    console.error(`file.id(${file.id}) !== video.id(${video.id})`);
                 }
             })
             return t;
@@ -141,14 +148,25 @@ function upload(video, temp) {
     })
 }
 
+function extractFilename(path: string) {
+    if (path.includes("/")) {
+        return path.substring(path.lastIndexOf("/") + 1);
+    }
+    else {
+        return path.substring(path.lastIndexOf("\\") + 1);
+    }
+}
+
 export async function progress() {
-    return await listen('progress', event => {
+    return await listen('progress', (event: {payload: any[]}) => {
+        // console.log('listen(progress)', event);
         // event.event is the event name (useful if you want to use a single callback fn for multiple event types)
         // event.payload is the payload object
         // console.log('!', event);
         currentTemplate.update((cur) => {
+            console.log(cur.selectedTemplate['files']);
             for (const file of cur.selectedTemplate['files']) {
-                if (file.id === event.payload[0]) {
+                if (file.id === extractFilename(event.payload[0])) {
                     // file.progress = Math.round(event.payload[1] * 100) / 100;
                     // $speed = Math.round(event.payload[1] * 100) / 100;
                     file.totalSize = event.payload[2];
@@ -166,13 +184,14 @@ export async function progress() {
 
 }
 export async function speed() {
-    return await listen('speed', event => {
+    return await listen('speed', (event: {payload: any[]}) => {
+        // console.log('listen(speed)', event);
         // event.event is the event name (useful if you want to use a single callback fn for multiple event types)
         // event.payload is the payload object
         // console.log('!', event);
         currentTemplate.update((cur) => {
             for (const file of cur.selectedTemplate['files']) {
-                if (file.id === event.payload[0]) {
+                if (file.id === extractFilename(event.payload[0])) {
                     // file.progress = Math.round(event.payload[1] * 100) / 100;
                     // $speed = Math.round(event.payload[1] * 100) / 100;
                     file.totalSize = event.payload[2];
@@ -190,15 +209,23 @@ export async function speed() {
 
 }
 
-export async function save_config(fn) {
+export async function save_config(configModifier: (config: BiliupConfig) => void) {
+    // TODO: use Writable for configs
     try {
-        let res = await invoke('load',)
-        fn(res);
+        let config = await load_config();
+        configModifier(config);
         return await invoke('save', {
-            config: res
+            config: config
         });
     } catch (e) {
         createPop(e, 5000);
         console.log(e);
     }
+}
+
+
+export async function load_config(): Promise<BiliupConfig> {
+    let config: BiliupConfig = await invoke("load");
+    console.log("config", config);
+    return config;
 }

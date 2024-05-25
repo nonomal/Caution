@@ -1,21 +1,23 @@
 <script lang="ts">
-    import {currentTemplate, template, save_config} from "./store.ts";
+    import {currentTemplate, template, save_config, isLogin, load_config} from "./store";
     import {fly} from 'svelte/transition';
     import {flip} from 'svelte/animate';
-    import {invoke} from "@tauri-apps/api/tauri";
-    import {fetch, ResponseType} from "@tauri-apps/api/http";
-    import {open} from "@tauri-apps/api/shell";
+    import {invoke} from "@tauri-apps/api/core";
+    import {fetch} from "@tauri-apps/plugin-http";
+    import {open} from "@tauri-apps/plugin-shell";
     import {configDir} from "@tauri-apps/api/path";
     import Modal from "./Modal.svelte";
     import {createPop} from "./common";
+    import {readDir, BaseDirectory, remove, copyFile} from "@tauri-apps/plugin-fs";
+    import type {BiliupConfig} from "./global";
+    import {INVOKE_COMMANDS} from "./lib/constants";
 
     let face = 'noface.jpg';
     let name = null;
-    invoke('get_myinfo').then((ret) => {
-        console.log(ret);
-        fetch(<string>ret['data']['face'], {method: "GET", responseType: ResponseType.Binary}).then((res)=>{
-            face = 'data:image/jpeg;base64,' + arrayBufferToBase64(res.data);
-        })
+    invoke('get_myinfo', {fileName: "cookies.json"}).then(async (ret) => {
+        console.log("get_myinfo", ret);
+        let resp = await fetch(<string>ret['data']['face'], {method: "GET"});
+        face = 'data:image/jpeg;base64,' + arrayBufferToBase64(await resp.arrayBuffer());
         name = ret['data']['name'];
     });
 
@@ -105,22 +107,41 @@
         $currentTemplate.current = item;
     }
 
-    async function openConfigDir(){
-        await open(await configDir()+'biliup');
+    async function getConfigDir(): Promise<string>{
+        let configDirectory = await configDir();
+        if (!configDirectory.endsWith('/')) {
+            configDirectory += '/';
+        }
+        return configDirectory;
     }
-    let lines = ['ws', 'qn', 'auto', 'bda2', 'kodo', 'cos', 'cos-internal'];
-    let line = 'auto';
-    let limit = 3;
+
+    async function openConfigDir(){
+        let configDirectory = await getConfigDir();
+        configDirectory += "biliup";
+        console.log("openConfigDir", configDirectory);
+        await open(configDirectory);
+    }
+    let lines: string[] = ['ws', 'qn', 'auto', 'bda2', 'kodo', 'cos', 'cos-internal'];
+    $: console.log("lines", lines);
+    let line: string = 'auto';
+    $: console.log("line", line);
+    let limit: number = 3;
+    let checkInputsBeforeSubmit: boolean = true;
 
     async function loadSettings() {
-        let ret = await invoke('load');
-        console.log(ret);
+        let ret = await load_config();
         if (ret.line === null) {
             line = 'auto';
         } else {
             line = ret.line;
         }
-        limit = <number>ret['limit'];
+        limit = ret.limit;
+
+        if (ret.checkInputsBeforeSubmit == undefined || ret.checkInputsBeforeSubmit == null) {
+            checkInputsBeforeSubmit = true;
+        } else {
+            checkInputsBeforeSubmit = ret.checkInputsBeforeSubmit;
+        }
     }
 
     async function saveSettings() {
@@ -131,18 +152,99 @@
                 ret.line = line;
             }
             ret.limit = limit;
+            ret.checkInputsBeforeSubmit = checkInputsBeforeSubmit;
         })
     }
 
     let tempName: string;
+
+    // Reads the `$APPDIR/users` directory recursively
+    async function readBiliupUsersDir() {
+        let entries = await readDir(await getConfigDir() + "biliup/users");
+        console.log("entries", entries);
+        for (const entry of entries) {
+            console.log("entry.name ", entry.name);
+            let ret = await invoke(INVOKE_COMMANDS.getOthersMyinfo, {fileName: `users/${entry.name}`});
+            console.log(INVOKE_COMMANDS.getOthersMyinfo, ret);
+            let newVar = {
+                name: ret['data']['name'],
+                face: 'noface.jpg',
+                mid: ret['data']['mid']
+            };
+            user = newVar;
+            people = [...people, newVar]
+            let res = await fetch(<string>ret['data']['face'], {method: "GET"});
+            newVar.face = 'data:image/jpeg;base64,' + arrayBufferToBase64(await res.arrayBuffer());
+            people = [...people]
+        }
+    }
+
+    readBiliupUsersDir().then(() => {
+        console.log("people", people);
+    });
+
+    let people = [];
+    async function processNewUser() {
+        await invoke('logout');
+        await remove(`${await configDir()}/biliup/cookies.json`);
+        isLogin.set(false);
+    }
+    let user;
+    async function processChangeUser() {
+        console.log("user", user);
+        await copyFile(`${await configDir()}/biliup/users/${user.mid}.json`, `${await configDir()}/biliup/cookies.json`);
+        await invoke('logout');
+        face = user.face;
+        name = user.name;
+        // isLogin.set(false);
+    }
+
+    $: console.log("user", user);
+    $: console.log("face", face);
 </script>
 <div class="flex flex-col w-72 h-screen px-4 pt-8 bg-inherit overflow-auto"
      transition:fly={{delay: 400, x: -100}}>
-    <div class="flex items-center px-3 -mx-2">
-        <img class="object-cover rounded-full h-9 w-9" src="{face}" alt="avatar"/>
-        <div data-tip="打开配置文件夹" class="tooltip">
-            <h4 on:click={openConfigDir} class="mx-2 font-medium text-gray-800 hover:underline truncate">{name}</h4>
+    <div class="flex items-center justify-between">
+        <div class="flex items-center flex-none">
+            <Modal>
+                <img slot="open-modal" class="object-cover rounded-full h-9 w-9 cursor-pointer hover:ring-2 hover:ring-purple-600 hover:ring-offset-2" src="{face}" alt="avatar"/>
+                <div slot="box" let:componentId>
+                    <label for="{componentId}" class="btn btn-sm btn-circle absolute right-2 top-2">✕</label>
+                    <label for="{componentId}" on:click={processNewUser} class="group block max-w-xs mx-auto rounded-lg p-2 bg-white ring-1 ring-slate-900/5 shadow-lg space-y-3 hover:bg-sky-500 hover:ring-sky-500">
+                        <div class="flex items-center space-x-3">
+                            <svg class="h-6 w-6 stroke-sky-500 group-hover:stroke-white" fill="none" viewBox="0 0 24 24">
+                                <!--                            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">-->
+                                <path stroke-linecap="round" stroke-linejoin="round" d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" />
+                                <!--                        </svg>-->
+                            </svg>
+                            <h3 class="text-slate-900 group-hover:text-white text-sm font-semibold">注销并添加新账号</h3>
+                        </div>
+                    </label>
+                    <ul role="list" class="p-6 divide-y divide-slate-200">
+                        {#each people as person}
+                            <!-- Remove top/bottom padding when first/last child -->
+                            <li class="flex items-center py-0.5 first:pt-0 last:pb-0 ">
+                                <img class="h-8 w-8 rounded-full" src="{person.face}" alt="" />
+                                <div class="form-control w-full mx-2">
+                                    <label class="label cursor-pointer">
+                                        <span class="label-text">{person.name}</span>
+                                        <input type="radio" name="radio-6" class="radio checked:bg-blue-500"
+                                               bind:group={user} value={person} checked />
+                                    </label>
+                                </div>
+                            </li>
+                        {/each}
+                    </ul>
+                    <div class="modal-action">
+                        <label for="{componentId}" on:click={processChangeUser} class="btn">切换账号</label>
+                    </div>
+                </div>
+            </Modal>
+            <div data-tip="打开配置文件夹" class="tooltip">
+                <h4 on:click={openConfigDir} class="ml-2 font-medium text-gray-800 hover:underline truncate max-w-[8rem]">{name}</h4>
+            </div>
         </div>
+
         <Modal>
             <a slot="open-modal" class="flex cursor-pointer tooltip items-center" data-tip="设置" on:click={loadSettings} >
                 <svg class="h-5 w-5" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor">
@@ -156,11 +258,16 @@
                     <input type="range" max="128" min="1" bind:value={limit} class="range  range-xs">
                     <!--                    <button class="btn btn-outline">线路: AUTO</button>-->
                     <h4>上传线路选择：</h4>
-                    <div class="btn-group">
+                    <div class="join">
                         {#each lines as l}
-                            <input type="radio" bind:group={line} value="{l}" data-title="{l}" class="btn btn-outline btn-xs">
+                            <input type="radio" bind:group={line} value={l} data-title={l} aria-label={l} class="join-item btn btn-outline">
                         {/each}
                     </div>
+<!--                    <h4>-->
+<!--                        提交前检查内容长度：-->
+<!--                        <input type="checkbox" bind:value={checkInputsBeforeSubmit}>-->
+<!--                    </h4>-->
+
                 </div>
 
                 <div class="modal-action">
@@ -168,7 +275,6 @@
                     <label for="{componentId}" class="btn">Close</label>
                 </div>
             </div>
-
         </Modal>
 
     </div>
@@ -236,7 +342,8 @@
     </div>
 </div>
 
-<style>
+<!-- TODO: enable this -->
+<style lang="postcss">
     .selected {
         @apply text-gray-700 bg-gray-200;
     }
